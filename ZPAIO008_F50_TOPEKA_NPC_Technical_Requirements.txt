@@ -1,0 +1,196 @@
+Technical Requirements Document
+Program: ZPAIO008_F50_TOPEKA_NPC (PI/PO Proxy Version)
+
+================================================================================
+1. PURPOSE
+================================================================================
+
+Generate a pipe-delimited extract of Form 50 (Notification of Personnel Action)
+records and transmit them to the Topeka National Print Center via SAP PI/PO
+proxy interface (SAP2LEGACY -> SAP2Topeka scenario) in serialized, chunked
+messages. The file includes employee personnel action data and current mailing
+address with DPC (Delivery Point Code) enrichment.
+
+================================================================================
+2. FUNCTIONAL REQUIREMENTS
+================================================================================
+
+2.1 Data Selection
+------------------
+- Source Table: ZPA_NOA_F50
+- Selection Criteria (user-provided):
+  - Employee Number (PERNR)
+  - Effective Date (EFFDT)
+  - NOA Code (NOACD)
+  - Username (UNAME)
+- Automatic Exclusions:
+  - Records created by users NG-BATCH and NGBATCH2
+  - NOA Code 170
+- Date Range Logic:
+  - Extract records where the processing date falls between the last two audit
+    program run timestamps (ZPAR_AUDIT_F50_PAYROLL, cycle controls AUD2 and
+    AUDT), and the effective date is on or before the current pay period end
+    date.
+  - Additionally include future-dated records that have matured into the current
+    pay period (effective date between pay period begin and end dates), when the
+    prior run occurred in a previous pay period.
+
+2.2 Pay Period Determination
+----------------------------
+- Derive current pay period begin/end dates from table T569V using payroll area
+  Z1, variant 01, via function module ZPY_PAYPERIOD_DATE.
+
+2.3 Employee Data Enrichment
+-----------------------------
+- Name: Retrieve current legal name from infotype PA0002 as of system date.
+  Fall back to ZPA_NOA_F50 name fields if no active record exists.
+- Mailing Address: Retrieve from infotype PA0006 as of system date. Prefer
+  subtype 3 (Mailing); fall back to subtype 1 (Permanent). Fall back to
+  ZPA_NOA_F50 address fields if no active record exists.
+- ZIP Code Formatting: Format as #####-####. Default ZIP+4 to 0000 if blank.
+
+2.4 DPC (Delivery Point Code) Enrichment
+-----------------------------------------
+- If the PA0006 address record has no DPC and street, city, and state are
+  populated, call ZCL_FIORI_COMMON_UTILITY=>AMS_ADDRESS_VALIDATE to obtain
+  the DPC.
+- Collect resolved addresses for subsequent update of PA0006 via
+  ZCL_IT_0006_UTILITY=>UPDATE_0006_RECORD.
+
+2.5 SSN Handling
+----------------
+- The employee SSN (ZZ_SSN) is included in the output as-is from the source
+  record. (Note: Unlike the prior file-based version, this version does not
+  mask the SSN.)
+
+2.6 Output Record Format
+-------------------------
+- Delimiter: Pipe (|)
+- Record Structure: Concatenation of two structures:
+  1. ZSTR_ZPAIO008_F50 - Form 50 fields (mapped from ZPA_NOA_F50), effective
+     date reformatted to MM-DD-YYYY.
+  2. ZSTR_ZPAIO008_ADDR - Address block: SSN, carrier control (1), page switch
+     (1), employee name, mailing address (street, city/state/ZIP), DPC, return
+     address.
+- All output is converted to UPPER CASE before transmission.
+- Data Cleansing: Non-printable/unwanted characters are removed via
+  ZCL_CLEAN_UNWANTED_CHARACTERS=>CLEAN_STRINGS before transmission.
+- Form Type Label: 1-EMPLOYEE COPY - RETAIN FOR FUTURE REFERENCE
+
+2.7 Return Address (Static)
+----------------------------
+  Office Name:      Greensboro HR Shared Svc Ctr
+  Mail Street:      PO Box 970100
+  Mail City/St/ZIP: Greensboro, NC 27497-0100
+
+================================================================================
+3. FILE TRANSMISSION REQUIREMENTS
+================================================================================
+
+3.1 Transmission Method
+------------------------
+- Output is sent via SAP PI/PO proxy class ZXI_CO_EMPLOYEES_FORM50 using the
+  configuration scenario SAP2Topeka (endpoint: http://usps.gov/Payroll ->
+  SI_Data_Out).
+
+3.2 Serialization
+-----------------
+- Messages are serialized using the IF_WSPROTOCOL_ASYNC_MESSAGING protocol.
+- Queue ID: FORM50QUEUE001 - guarantees in-order delivery of all chunks.
+
+3.3 Chunked Transmission
+-------------------------
+- Output records are transmitted in chunks of configurable size (parameter
+  P_MAX, default 200 records per message).
+- Each proxy call includes:
+  - FILE_DIRECTORY - physical directory resolved from logical filename.
+  - FILE_NAME - physical filename resolved from logical filename.
+  - ROW[] - array of pipe-delimited record strings (type
+    ZXI_FORM50_EMP_PRINT_ROW).
+- A COMMIT WORK is issued after each chunk to push the message to the PI/PO
+  outbound queue.
+- Processing continues in a loop until all records are sent.
+
+3.4 Logical File Resolution
+----------------------------
+- Logical filename ZPAIO008_FILE is resolved via FILE_GET_NAME (full path) and
+  FILE_GET_NAME_AND_LOGICAL_PATH (filename only) to derive the directory and
+  filename passed to the proxy.
+
+================================================================================
+4. EXECUTION MODES
+================================================================================
+
+  Mode            Behavior
+  --------------- ---------------------------------------------------------------
+  Test (P_TEST=X) Select and format data only. No proxy transmission, no DPC
+                  update.
+  Production      Full processing: transmit via proxy, update DPC on PA0006.
+
+================================================================================
+5. SELECTION SCREEN
+================================================================================
+
+  Block              Parameter  Description                              Type
+  ------------------ ---------- ---------------------------------------- --------
+  File (BLK_FLNM)   P_FILE     Logical filename (def: ZPAIO008_FILE)    Filename
+  File (BLK_FLNM)   P_TEST     Test mode flag                           Checkbox
+  Application        P_MAX      Records per chunk (default: 200)         Integer
+  Selection (BLK)    S_PERNR    Employee Number                          Sel-Opt
+  Selection (BLK)    S_EFFDT    Effective Date                           Sel-Opt
+  Selection (BLK)    S_NOACD    NOA Code                                 Sel-Opt
+  Selection (BLK)    S_UNAME    Username                                 Sel-Opt
+
+================================================================================
+6. INTERFACE / DEPENDENCY SUMMARY
+================================================================================
+
+  Component                                    Type           Purpose
+  -------------------------------------------- -------------- -------------------
+  ZPA_NOA_F50                                  DB Table       Source NOA records
+  PA0002                                       SAP Infotype   Employee name
+  PA0006                                       SAP Infotype   Mailing address/DPC
+  T569V                                        SAP Table      Pay period lookup
+  ZCYCLE_CONTROL                               DB Table       Last-run timestamps
+  ZSTR_ZPAIO008_F50                            Structure      Form 50 layout
+  ZSTR_ZPAIO008_ADDR                           Structure      Address layout
+  ZXI_CO_EMPLOYEES_FORM50                      Proxy Class    PI/PO outbound proxy
+  ZXI_DT_DATA_ROW                              Proxy Type     Payload structure
+  ZXI_FORM50_EMP_PRINT1                        Proxy Type     Payload structure
+  ZXI_FORM50_EMP_PRINT_ROW                     Proxy Type     Payload structure
+  ZPY_PAYPERIOD_DATE                           Function Mod   Pay period dates
+  Z_READ_CYCLE_CONTROL                         Function Mod   Read cycle control
+  FILE_GET_NAME                                SAP FM         Resolve logical file
+  FILE_GET_NAME_AND_LOGICAL_PATH               SAP FM         Resolve logical file
+  ZCL_FIORI_COMMON_UTILITY=>AMS_ADDRESS_VALIDATE  Class Method   DPC lookup
+  ZCL_IT_0006_UTILITY=>UPDATE_0006_RECORD      Class Method   Update IT0006 DPC
+  ZCL_CLEAN_UNWANTED_CHARACTERS=>CLEAN_STRINGS Class Method   Remove bad chars
+  ZPAIO008_FILE                                Logical File   Physical path/name
+
+================================================================================
+7. KEY DIFFERENCES FROM PRIOR FILE-BASED VERSION
+================================================================================
+
+  Area                Prior Version                  This Version
+  ------------------- ------------------------------ ----------------------------
+  Delivery            Unix file via OPEN DATASET     SAP PI/PO proxy with queue
+  Chunking            Single file write              Configurable batch (P_MAX)
+  Char Cleansing      OS cmd ZRMV_NONPRT_CHARS       ABAP class method
+  File Archival       Prior files moved to archive/  Not applicable (PI/PO)
+  Report Output       Full report with counts/errors No report file output
+  Cycle Control       Updated after successful run   Read only; not updated
+  SSN                 Masked as XXX-XX-XXXX          Passed as-is from source
+  Includes            ZUTI_INTERFACES etc.           None
+  Case                As-is                          All output UPPER CASE
+
+================================================================================
+8. NON-FUNCTIONAL REQUIREMENTS
+================================================================================
+
+- Report Attributes: No standard page heading; line size 126; line count 65;
+  message class ZI.
+- Error Handling: PI/PO proxy errors (CX_AI_SYSTEM_FAULT,
+  CX_AI_APPLICATION_FAULT) raise error message E999 in message class ZHR_PA.
+  DPC update errors are silently ignored.
+- Message Ordering: Guaranteed via serialization context on queue
+  FORM50QUEUE001.
